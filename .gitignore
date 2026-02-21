@@ -5,3 +5,8 @@ __pycache__/
 checkpoints/
 outputs/
 wandb/
+splits/
+*.zip
+*.tar.gz
+train/
+val/
