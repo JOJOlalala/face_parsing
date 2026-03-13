@@ -144,6 +144,46 @@ def flip_with_label_swap(
     return img_out, mask_out
 
 
+def make_face_aug(
+    p_flip: float = 0.5,
+    p_geom: float = 0.7,
+    p_color: float = 0.7,
+    p_blur: float = 0.15,
+) -> callable:
+    """
+    Combined augmentation for face parsing that correctly handles label swapping.
+
+    Pipeline:
+      1. flip_with_label_swap  — spatially correct, swaps l/r paired labels
+      2. ShiftScaleRotate      — mild geometric distortion
+      3. ColorJitter           — photometric variation
+      4. GaussianBlur          — optional light blur
+
+    The albumentations pipeline is built WITHOUT HorizontalFlip so the
+    label-aware flip in step 1 is the only horizontal flip applied.
+    """
+    album = A.Compose([
+        A.ShiftScaleRotate(
+            shift_limit=0.03,
+            scale_limit=0.20,
+            rotate_limit=10,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            mask_value=0,
+            p=p_geom,
+        ),
+        A.ColorJitter(brightness=0.3, contrast=0.2, saturation=0.15, hue=0.05, p=p_color),
+        A.GaussianBlur(blur_limit=(3, 5), p=p_blur),
+    ])
+
+    def aug_fn(img: np.ndarray, mask: np.ndarray):
+        img, mask = flip_with_label_swap(img, mask, p=p_flip)
+        out = album(image=img, mask=mask.astype(np.int32))
+        return out["image"], out["mask"].astype(np.int64)
+
+    return aug_fn
+
+
 def apply_aug(aug, img_uint8: np.ndarray, mask_int64: np.ndarray):
     """
     img_uint8: (H,W,3) uint8
