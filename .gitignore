@@ -10,3 +10,4 @@ splits/
 *.tar.gz
 train/
 val/
+test/
