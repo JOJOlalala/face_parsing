@@ -263,7 +263,7 @@ def main():
         model = ddp_model
         if is_main: print(f"torch.compile: skipped ({e})")
 
-    num_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    num_params = sum(p.numel() for p in raw_model.parameters())
     ema        = EMAKeeper(raw_model, decay=args.ema_decay)
 
     # ── Optimizer + scheduler ─────────────────────────────────────────────────
