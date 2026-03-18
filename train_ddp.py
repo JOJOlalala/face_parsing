@@ -92,8 +92,10 @@ def _parse_args():
                    help="Sampling multiplier for images containing hat/ear_r/neck_l")
 
     # ── Misc ───────────────────────────────────────────────────────────────────
-    p.add_argument("--ema-decay",  type=float, default=0.999)
-    p.add_argument("--ckpt-path",  default="checkpoints/best_ddp.pt")
+    p.add_argument("--ema-decay",    type=float, default=0.999)
+    p.add_argument("--ckpt-path",    default="checkpoints/best_ddp.pt")
+    p.add_argument("--full-dataset", action="store_true",
+                   help="Train on all images (no val split). Saves final checkpoint only.")
 
     return p.parse_args()
 
@@ -204,10 +206,15 @@ def main():
 
     # ── Split ─────────────────────────────────────────────────────────────────
     all_files = list_images(img_dir)
-    train_files, val_files = make_split(all_files, val_ratio=args.val_ratio, seed=args.seed)
-    if is_main:
-        save_split(train_files, val_files, out_dir="splits", tag=f"seed{args.seed}_vr{args.val_ratio}")
-        print(f"Split: {len(train_files)} train / {len(val_files)} val")
+    if args.full_dataset:
+        train_files, val_files = all_files, []
+        if is_main:
+            print(f"Full-dataset mode: {len(train_files)} train / no val")
+    else:
+        train_files, val_files = make_split(all_files, val_ratio=args.val_ratio, seed=args.seed)
+        if is_main:
+            save_split(train_files, val_files, out_dir="splits", tag=f"seed{args.seed}_vr{args.val_ratio}")
+            print(f"Split: {len(train_files)} train / {len(val_files)} val")
 
     # ── Class weights (all ranks compute identically — same inputs, same result) ──
     pixel_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
@@ -241,15 +248,18 @@ def main():
         replacement=True,
         generator=train_generator,
     )
-    val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank,
-                                     shuffle=False, drop_last=False)
-
     train_loader = DataLoader(train_ds, batch_size=args.batch_per_gpu, sampler=train_sampler,
                               num_workers=4, pin_memory=True,
                               persistent_workers=True, prefetch_factor=2)
-    val_loader   = DataLoader(val_ds,   batch_size=16, sampler=val_sampler,
-                              num_workers=2, pin_memory=True,
-                              persistent_workers=True, prefetch_factor=2)
+
+    if not args.full_dataset:
+        val_sampler = DistributedSampler(val_ds, num_replicas=world_size, rank=rank,
+                                         shuffle=False, drop_last=False)
+        val_loader  = DataLoader(val_ds, batch_size=16, sampler=val_sampler,
+                                 num_workers=2, pin_memory=True,
+                                 persistent_workers=True, prefetch_factor=2)
+    else:
+        val_loader = None
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model_cls = LiteUNetV2 if args.model == "liteunetv2" else UNetV2
@@ -353,33 +363,50 @@ def main():
             running += loss.item()
 
         scheduler.step()
-        val_f1, per_class_f1, val_fscore = validate(model, raw_model, val_loader, device, amp_dtype, ema)
         elapsed    = time.time() - t0
         train_loss = running / max(1, len(train_loader))
         cur_lr     = scheduler.get_last_lr()[0]
 
-        if is_main:
-            wandb.log({"epoch": epoch, "train/loss": train_loss, "val/macro_f1": val_f1,
-                       "val/fscore": val_fscore, "lr": cur_lr, "time/epoch_sec": elapsed,
-                       "ema/decay": min(args.ema_decay, (1 + ema.num_updates) / (10 + ema.num_updates))})
-            print(f"[{epoch:03d}/{args.epochs}] loss={train_loss:.4f}  val_F1={val_f1:.4f}"
-                  f"  fscore={val_fscore:.4f}  lr={cur_lr:.2e}  time={elapsed:.1f}s")
+        if args.full_dataset:
+            if is_main:
+                wandb.log({"epoch": epoch, "train/loss": train_loss, "lr": cur_lr,
+                           "time/epoch_sec": elapsed,
+                           "ema/decay": min(args.ema_decay, (1 + ema.num_updates) / (10 + ema.num_updates))})
+                print(f"[{epoch:03d}/{args.epochs}] loss={train_loss:.4f}  lr={cur_lr:.2e}  time={elapsed:.1f}s")
+        else:
+            val_f1, per_class_f1, val_fscore = validate(model, raw_model, val_loader, device, amp_dtype, ema)
+            if is_main:
+                wandb.log({"epoch": epoch, "train/loss": train_loss, "val/macro_f1": val_f1,
+                           "val/fscore": val_fscore, "lr": cur_lr, "time/epoch_sec": elapsed,
+                           "ema/decay": min(args.ema_decay, (1 + ema.num_updates) / (10 + ema.num_updates))})
+                print(f"[{epoch:03d}/{args.epochs}] loss={train_loss:.4f}  val_F1={val_f1:.4f}"
+                      f"  fscore={val_fscore:.4f}  lr={cur_lr:.2e}  time={elapsed:.1f}s")
 
-            if val_f1 > best_f1:
-                best_f1 = val_f1
-                torch.save({
-                    "model":        raw_model.state_dict(),
-                    "ema_shadow":   ema.shadow,
-                    "optimizer":    optimizer.state_dict(),
-                    "epoch":        epoch,
-                    "best_f1":      best_f1,
-                    "per_class_f1": per_class_f1.tolist(),
-                    "args":         vars(args),
-                }, args.ckpt_path)
-                print(f"  saved {args.ckpt_path}  (F1={best_f1:.4f})")
+                if val_f1 > best_f1:
+                    best_f1 = val_f1
+                    torch.save({
+                        "model":        raw_model.state_dict(),
+                        "ema_shadow":   ema.shadow,
+                        "optimizer":    optimizer.state_dict(),
+                        "epoch":        epoch,
+                        "best_f1":      best_f1,
+                        "per_class_f1": per_class_f1.tolist(),
+                        "args":         vars(args),
+                    }, args.ckpt_path)
+                    print(f"  saved {args.ckpt_path}  (F1={best_f1:.4f})")
 
     if is_main:
-        print(f"\nBest val macro-F1: {best_f1:.4f}")
+        if args.full_dataset:
+            torch.save({
+                "model":      raw_model.state_dict(),
+                "ema_shadow": ema.shadow,
+                "optimizer":  optimizer.state_dict(),
+                "epoch":      args.epochs,
+                "args":       vars(args),
+            }, args.ckpt_path)
+            print(f"\nSaved final checkpoint: {args.ckpt_path}")
+        else:
+            print(f"\nBest val macro-F1: {best_f1:.4f}")
         wandb.finish()
 
     dist.destroy_process_group()
